@@ -148,6 +148,8 @@ if USE_MYPYC:
         # Use multi-file compliation mode on windows because without it
         # our Appveyor builds run out of memory sometimes.
         multi_file=sys.platform == 'win32' or force_multifile,
+        separate=True,
+        verbose=True,
     )
     cmdclass['build_ext'] = MypycifyBuildExt
 else:
