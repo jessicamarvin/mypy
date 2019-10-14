@@ -3,12 +3,15 @@
 # FIXME: Basically nothing in this file operates on the level of a
 # single module and it should be renamed.
 
+import json
 from collections import OrderedDict
 from typing import List, Tuple, Dict, Iterable, Set, TypeVar, Optional
 
-from mypy.build import BuildSource, BuildResult, build
+from mypy.nodes import MypyFile
+from mypy.build import BuildSource, BuildResult, State, build, sorted_components, delete_cache
 from mypy.errors import CompileError
 from mypy.options import Options
+from mypy.plugin import Plugin
 
 from mypyc import genops
 from mypyc.common import PREFIX, TOP_LEVEL_NAME, INT_PREFIX, MODULE_PREFIX, shared_lib_name
@@ -19,7 +22,8 @@ from mypyc.emitwrapper import (
     generate_wrapper_function, wrapper_function_header,
 )
 from mypyc.ops import (
-    FuncIR, ClassIR, ModuleIR, ModuleIRs, LiteralsMap, RType, RTuple
+    FuncIR, ClassIR, ModuleIR, ModuleIRs, LiteralsMap, RType, RTuple,
+    DeserMaps, deserialize_modules,
 )
 from mypyc.options import CompilerOptions
 from mypyc.uninit import insert_uninit_checks
@@ -63,15 +67,119 @@ class MarkedDeclaration:
         self.mark = False
 
 
+class MypycPlugin(Plugin):
+    def __init__(self, options: Options, groups: Groups) -> None:
+        super().__init__(options)
+        self.group_map = {}  # type: Dict[str, List[str]]
+        for sources, _ in groups:
+            modules = [source.module for source in sources]
+            for id in modules:
+                self.group_map[id] = modules
+
+    def get_additional_deps(self, file: MypyFile) -> List[Tuple[int, str, int]]:
+        return [(10, id, -1) for id in self.group_map.get(file.fullname(), [])]
+
+
 def parse_and_typecheck(sources: List[BuildSource], options: Options,
+                        groups: Groups,
                         alt_lib_path: Optional[str] = None) -> BuildResult:
     assert options.strict_optional, 'strict_optional must be turned on'
     result = build(sources=sources,
                    options=options,
-                   alt_lib_path=alt_lib_path)
+                   alt_lib_path=alt_lib_path,
+                   extra_plugins=[MypycPlugin(options, groups)])
     if result.errors:
         raise CompileError(result.errors)
     return result
+
+
+def compile_scc_to_ir(
+    scc: List[MypyFile],
+    result: BuildResult,
+    mapper: genops.Mapper,
+    compiler_options: CompilerOptions,
+    errors: Errors,
+) -> ModuleIRs:
+    """Compile an SCC into ModuleIRs.
+
+    Any modules that this SCC depends on must have either compiled or
+    loaded from a cache into mapper.
+
+    Arguments:
+        scc: The list of MypyFiles to compile
+        result: The BuildResult from the mypy front-end
+        mapper: The Mapper object mapping mypy ASTs to class and func IRs
+        compiler_options: The compilation options
+        errors: Where to report any errors encountered
+
+    Returns the IR of the modules.
+    """
+
+    if compiler_options.verbose:
+        print("Compiling {}".format(", ".join(x.name() for x in scc)))
+
+    # Generate basic IR, with missing exception and refcount handling.
+    modules = genops.build_ir(scc, result.graph, result.types,
+                              mapper,
+                              compiler_options, errors)
+    if errors.num_errors > 0:
+        return modules
+
+    # Insert uninit checks.
+    for module in modules.values():
+        for fn in module.functions:
+            insert_uninit_checks(fn)
+    # Insert exception handling.
+    for module in modules.values():
+        for fn in module.functions:
+            insert_exception_handling(fn)
+    # Insert refcount handling.
+    for module in modules.values():
+        for fn in module.functions:
+            insert_ref_count_opcodes(fn)
+
+    return modules
+
+
+def write_scc_cache(modules: ModuleIRs, result: BuildResult, *, has_errors: bool) -> None:
+    """Write out the cache information for an SCC of modules.
+
+    Deletes cache files if there have been errors.
+    """
+    # Write out cache data
+    for id, module in modules.items():
+        st = result.graph[id]
+        newpath = get_ir_cache_name(st)
+        # If things are good, write out cache data. Otherwise try deleting things.
+        if not has_errors:
+            result.manager.metastore.write(newpath, json.dumps(module.serialize()))
+        else:
+            try:
+                result.manager.metastore.remove(newpath)
+            except OSError:
+                pass
+            delete_cache(st.id, st.xpath, result.manager)
+
+
+def load_scc_from_cache(
+    scc: List[MypyFile],
+    result: BuildResult,
+    mapper: genops.Mapper,
+    ctx: DeserMaps,
+) -> ModuleIRs:
+    """Load IR for an SCC of modules from the cache.
+
+    Arguments and return are as compile_scc_to_ir.
+    """
+
+    cache_data = {
+        k.name(): json.loads(
+            result.manager.metastore.read(get_ir_cache_name(result.graph[k.name()]))
+        ) for k in scc
+    }
+    modules = deserialize_modules(cache_data, ctx)
+    genops.load_type_map(mapper, scc, ctx)
+    return modules
 
 
 def compile_modules_to_c(
@@ -99,51 +207,62 @@ def compile_modules_to_c(
     Returns the IR of the modules and a list containing the generated files for each group.
     """
     module_names = [source.module for group_sources, _ in groups for source in group_sources]
-    file_nodes = [result.files[name] for name in module_names]
 
     # Construct a map from modules to what group they belong to
     group_map = {}
     for group, lib_name in groups:
         for source in group:
             group_map[source.module] = lib_name
-
-    # Generate basic IR, with missing exception and refcount handling.
     mapper = genops.Mapper(group_map)
-    modules = genops.build_ir(file_nodes, result.graph, result.types,
-                              mapper,
-                              compiler_options, errors)
-    if errors.num_errors > 0:
-        return modules, []
-    # Insert uninit checks.
-    for module in modules.values():
-        for fn in module.functions:
-            insert_uninit_checks(fn)
-    # Insert exception handling.
-    for module in modules.values():
-        for fn in module.functions:
-            insert_exception_handling(fn)
-    # Insert refcount handling.
-    for module in modules.values():
-        for fn in module.functions:
-            insert_ref_count_opcodes(fn)
+    deser_ctx = DeserMaps({}, {})
 
-    source_paths = {module_name: result.files[module_name].path
+    graph = result.graph
+    sccs = sorted_components(graph)
+
+    modules = {}
+    for scc in sccs:
+        sccs_states = [result.graph[id] for id in scc]
+        trees = [st.tree for st in sccs_states if st.id in mapper.group_map and st.tree]
+
+        if not trees:
+            continue
+
+        fresh = all(id not in result.manager.rechecked_modules for id in scc)
+        if fresh:
+            load_scc_from_cache(trees, result, mapper, deser_ctx)
+        else:
+            scc_ir = compile_scc_to_ir(trees, result, mapper, compiler_options, errors)
+            write_scc_cache(scc_ir, result, has_errors=errors.num_errors > 0)
+            modules.update(scc_ir)
+
+    source_paths = {module_name: result.graph[module_name].xpath
                     for module_name in module_names}
 
     names = NameGenerator([[source.module for source in sources] for sources, _ in groups])
 
     # Generate C code for each compilation group. Each group will be
     # compiled into a separate extension module.
-    ctext = []
+    ctext = []  # type: List[List[Tuple[str, str]]]
     for group_sources, group_name in groups:
-        group_modules = [(source.module, modules[source.module]) for source in group_sources]
+        group_modules = [(source.module, modules[source.module]) for source in group_sources
+                         if source.module in modules]
+        if not group_modules:
+            ctext.append([])
+            continue
         literals = mapper.literals[group_name]
         generator = GroupGenerator(
             literals, group_modules, source_paths, group_name, group_map, names,
             compiler_options.multi_file
         )
         ctext.append(generator.generate_c_for_modules())
+
+    result.manager.metastore.commit()
+
     return modules, ctext
+
+
+def get_ir_cache_name(st: State) -> str:
+    return st.xmeta.data_json.replace('.data.json', '.ir.json')  # LURR
 
 
 def generate_function_declaration(fn: FuncIR, emitter: Emitter) -> None:

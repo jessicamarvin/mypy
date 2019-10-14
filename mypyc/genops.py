@@ -14,7 +14,7 @@ It would be translated to something that conceptually looks like this:
    return r3
 """
 from typing import (
-    TypeVar, Callable, Dict, List, Tuple, Optional, Union, Sequence, Set, Any, cast
+    TypeVar, Callable, Dict, List, Tuple, Optional, Union, Sequence, Set, Any, Iterable, cast
 )
 from typing_extensions import overload, NoReturn
 from collections import OrderedDict
@@ -68,7 +68,8 @@ from mypyc.ops import (
     NAMESPACE_TYPE, NAMESPACE_MODULE,
     RaiseStandardError, LoadErrorValue, NO_TRACEBACK_LINE_NO, FuncDecl,
     FUNC_NORMAL, FUNC_STATICMETHOD, FUNC_CLASSMETHOD,
-    RUnion, is_optional_type, optional_value_type, all_concrete_classes
+    RUnion, is_optional_type, optional_value_type, all_concrete_classes,
+    DeserMaps,
 )
 from mypyc.ops_primitive import binary_ops, unary_ops, func_ops, method_ops, name_ref_ops
 from mypyc.ops_list import (
@@ -149,14 +150,22 @@ def build_type_map(mapper: 'Mapper',
     # so that we can easily pick out the right copy of a function that
     # is conditionally defined.
     for module in modules:
-        for name, node in module.names.items():
-            # We need to filter out functions that are imported or
-            # aliases.  The best way to do this seems to be by
-            # checking that the fullname matches.
-            if (isinstance(node.node, (FuncDef, Decorator, OverloadedFuncDef))
-                    and node.fullname == module.fullname() + '.' + name):
-                prepare_func_def(module.fullname(), None, get_func_def(node.node), mapper)
+        for func in get_module_func_defs(module):
+            prepare_func_def(module.fullname(), None, func, mapper)
             # TODO: what else?
+
+
+def load_type_map(mapper: 'Mapper',
+                  modules: List[MypyFile],
+                  deser_ctx: DeserMaps) -> None:
+    for module in modules:
+        for node in module.defs:
+            if isinstance(node, ClassDef):
+                mapper.type_to_ir[node.info] = deser_ctx.classes[node.fullname]
+
+    for module in modules:
+        for func in get_module_func_defs(module):
+            mapper.func_to_decl[func] = deser_ctx.functions[func.fullname()].decl
 
 
 @strict_optional_dec  # Turn on strict optional for any type manipulations we do
@@ -172,7 +181,6 @@ def build_ir(modules: List[MypyFile],
     result = OrderedDict()  # type: ModuleIRs
 
     # Generate IR for all modules.
-    module_names = [mod.fullname() for mod in modules]
     class_irs = []
 
     for module in modules:
@@ -182,7 +190,7 @@ def build_ir(modules: List[MypyFile],
 
         # Second pass.
         builder = IRBuilder(
-            module.fullname(), types, graph, errors, mapper, module_names, pbv, options
+            module.fullname(), types, graph, errors, mapper, pbv, options
         )
         builder.visit_mypy_file(module)
         module_ir = ModuleIR(
@@ -277,6 +285,16 @@ def get_func_def(op: Union[FuncDef, Decorator, OverloadedFuncDef]) -> FuncDef:
     if isinstance(op, Decorator):
         op = op.func
     return op
+
+
+def get_module_func_defs(module: MypyFile) -> Iterable[FuncDef]:
+    for name, node in module.names.items():
+        # We need to filter out functions that are imported or
+        # aliases.  The best way to do this seems to be by
+        # checking that the fullname matches.
+        if (isinstance(node.node, (FuncDef, Decorator, OverloadedFuncDef))
+                and node.fullname == module.fullname() + '.' + name):
+            yield get_func_def(node.node)
 
 
 def specialize_parent_vtable(cls: ClassIR, parent: ClassIR) -> VTableEntries:
@@ -1046,7 +1064,6 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
                  graph: Graph,
                  errors: Errors,
                  mapper: Mapper,
-                 modules: List[str],
                  pbv: PreBuildVisitor,
                  options: CompilerOptions) -> None:
         self.current_module = current_module
@@ -1059,7 +1076,6 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
         self.functions = []  # type: List[FuncIR]
         self.classes = []  # type: List[ClassIR]
         self.final_names = []  # type: List[Tuple[str, RType]]
-        self.modules = set(modules)
         self.callable_class_names = set()  # type: Set[str]
         self.options = options
 
@@ -2822,11 +2838,14 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
         value = bytes(expr.value, 'utf8').decode('unicode-escape').encode('raw-unicode-escape')
         return self.load_static_bytes(value)
 
+    def is_native_module(self, module: str) -> bool:
+        return module in self.mapper.group_map
+
     def is_native_ref_expr(self, expr: RefExpr) -> bool:
         if expr.node is None:
             return False
         if '.' in expr.node.fullname():
-            return expr.node.fullname().rpartition('.')[0] in self.modules
+            return self.is_native_module(expr.node.fullname().rpartition('.')[0])
         return True
 
     def is_native_module_ref_expr(self, expr: RefExpr) -> bool:
@@ -2863,7 +2882,7 @@ class IRBuilder(ExpressionVisitor[Value], StatementVisitor[None]):
                 if is_final:
                     final_var = sym.node
                     fullname = '{}.{}'.format(sym.node.info.fullname(), final_var.name())
-                    native = expr.expr.node.module_name in self.modules
+                    native = self.is_native_module(expr.expr.node.module_name)
         elif self.is_module_member_expr(expr):
             # a module attribute
             if isinstance(expr.node, Var) and expr.node.is_final:

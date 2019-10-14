@@ -159,7 +159,7 @@ class TestRun(MypycDataSuite):
         options.python_version = max(sys.version_info[:2], (3, 6))
         options.export_types = True
         options.preserve_asts = True
-        options.incremental = False
+        options.incremental = self.separate
 
         # Avoid checking modules/packages named 'unchecked', to provide a way
         # to test interacting with code we don't have types for.
@@ -197,6 +197,7 @@ class TestRun(MypycDataSuite):
             result = emitmodule.parse_and_typecheck(
                 sources=sources,
                 options=options,
+                groups=groups,
                 alt_lib_path='.')
             errors = Errors()
             compiler_options = CompilerOptions(multi_file=self.multi_file)

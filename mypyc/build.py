@@ -79,7 +79,8 @@ def fail(message: str) -> 'NoReturn':
 
 
 def get_mypy_config(paths: List[str],
-                    mypy_options: Optional[List[str]]) -> Tuple[List[BuildSource], Options]:
+                    mypy_options: Optional[List[str]],
+                    compiler_options: CompilerOptions) -> Tuple[List[BuildSource], Options]:
     """Construct mypy BuildSources and Options from file and options lists"""
     # It is kind of silly to do this but oh well
     mypy_options = mypy_options or []
@@ -99,8 +100,7 @@ def get_mypy_config(paths: List[str],
     options.show_traceback = True
     # Needed to get types for all AST nodes
     options.export_types = True
-    # TODO: Support incremental checking
-    options.incremental = False
+    options.incremental = compiler_options.separate
     options.preserve_asts = True
 
     for source in sources:
@@ -184,7 +184,7 @@ def generate_c(sources: List[BuildSource],
     # Do the actual work now
     t0 = time.time()
     try:
-        result = emitmodule.parse_and_typecheck(sources, options)
+        result = emitmodule.parse_and_typecheck(sources, options, groups)
     except CompileError as e:
         for line in e.messages:
             print(line)
@@ -401,7 +401,8 @@ def mypycify(
 
     setup_mypycify_vars()
     compiler_options = CompilerOptions(strip_asserts=strip_asserts,
-                                       multi_file=multi_file, verbose=verbose)
+                                       multi_file=multi_file, verbose=verbose,
+                                       separate=separate is not False)
 
     # Create a compiler object so we can make decisions based on what
     # compiler is being used. typeshed is missing some attribues on the
@@ -419,7 +420,7 @@ def mypycify(
     except FileExistsError:
         pass
 
-    sources, options = get_mypy_config(expanded_paths, mypy_options)
+    sources, options = get_mypy_config(expanded_paths, mypy_options, compiler_options)
     # We generate a shared lib if there are multiple modules or if any
     # of the modules are in package. (Because I didn't want to fuss
     # around with making the single module code handle packages.)
